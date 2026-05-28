@@ -26,7 +26,7 @@ import {
   MonitorCheck
 } from 'lucide-react';
 
-import { ScannedPlate, ExtractionResults, TesseractProgress } from './types';
+import { ScannedPlate, ExtractionResults, TesseractProgress, BatchItem } from './types';
 import { parseSiemensPlate, normalizeOcrText, SIEMENS_FAMILIES } from './utils/parser';
 import CameraScanner from './components/CameraScanner';
 import ImageAdjuster from './components/ImageAdjuster';
@@ -56,6 +56,259 @@ export default function App() {
 
   // Clipboard copies trackers
   const [copiedField, setCopiedField] = useState<string>('');
+
+  // Batch Processing States
+  const [isBatchMode, setIsBatchMode] = useState<boolean>(false);
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [isProcessingBatch, setIsProcessingBatch] = useState<boolean>(false);
+
+  // Helper to handle multiple batch files
+  const handleBatchFiles = (files: File[]) => {
+    setIsAdjusting(false);
+    setShowCamera(false);
+    setIsBatchMode(true);
+    
+    const items: BatchItem[] = files.map((file, idx) => ({
+      id: 'batch_item_' + idx + '_' + Date.now(),
+      name: file.name,
+      size: file.size,
+      file: file,
+      status: 'queued',
+      progress: 0
+    }));
+
+    setBatchItems(items);
+  };
+
+  const runTesseractOnDataUrl = (dataUrl: string, itemId: string): Promise<{ success: boolean; parsed?: ExtractionResults; rawText?: string }> => {
+    return new Promise((resolve) => {
+      Tesseract.recognize(
+        dataUrl,
+        'eng',
+        {
+          logger: m => {
+            if (m.status === 'recognizing text') {
+              setBatchItems((prev) =>
+                prev.map((i) =>
+                  i.id === itemId ? { ...i, progress: Math.round((m.progress || 0) * 100) } : i
+                )
+              );
+            }
+          }
+        }
+      ).then(({ data: { text } }) => {
+        if (text && text.trim().length > 0) {
+          const parsed = parseSiemensPlate(text);
+          parsed.ocrEngine = 'tesseract';
+          resolve({ success: true, parsed, rawText: text });
+        } else {
+          resolve({ success: false });
+        }
+      }).catch((err) => {
+        console.error('Tesseract batch error:', err);
+        resolve({ success: false });
+      });
+    });
+  };
+
+  const processBatchItem = async (item: BatchItem): Promise<BatchItem> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const dataUrl = event.target?.result as string;
+        
+        // Update item status to processing
+        setBatchItems((prev) =>
+          prev.map((i) =>
+            i.id === item.id ? { ...i, status: 'processing', dataUrl, progress: 30 } : i
+          )
+        );
+
+        try {
+          // Send to Gemini OCR API first
+          const apiResponse = await fetch('/api/ocr', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ image: dataUrl }),
+          });
+
+          if (apiResponse.ok) {
+            const data = await apiResponse.json();
+            const formattedMlfb = data.mlfb || '';
+            const parsed: ExtractionResults = {
+              mlfb: formattedMlfb,
+              mlfbFormatted: formattedMlfb,
+              mlfbMatchConfidence: 98,
+              zCodes: data.zCodes || [],
+              zExplanation: {},
+              serial: data.serial || '',
+              fdDate: data.fdDate || '',
+              voltage: data.voltage || '',
+              current: data.current || '',
+              power: data.power || '',
+              speed: data.speed || '',
+              frequency: data.frequency || '',
+              cosPhi: data.cosPhi || '',
+              ipRating: data.ipRating || '',
+              weight: data.weight || '',
+              efficiency: data.efficiency || '',
+              modelType: data.modelType || 'other',
+              mlfbAdjustments: data.mlfbAdjustments || [],
+              ocrEngine: 'gemini'
+            };
+
+            const { SIEMENS_Z_CODES, SIEMENS_FAMILIES } = await import('./utils/parser');
+            if (parsed.zCodes && parsed.zCodes.length > 0) {
+              parsed.zExplanation = {};
+              parsed.zCodes.forEach(code => {
+                if (parsed.zExplanation) {
+                  parsed.zExplanation[code] = SIEMENS_Z_CODES[code] || 'Opción Siemens personalizada (Detalles técnicos según catálogo)';
+                }
+              });
+            }
+
+            const prefix3 = parsed.mlfb.substring(0, 3);
+            let matchedFamily = SIEMENS_FAMILIES[prefix3];
+            if (!matchedFamily && prefix3.startsWith('6ES')) {
+              matchedFamily = SIEMENS_FAMILIES['6ES'];
+            }
+            if (matchedFamily) {
+              parsed.mlfbParts = {
+                family: matchedFamily.name,
+                type: parsed.mlfb.length > 7 ? parsed.mlfb.substring(4, 7) : '',
+                suffix: parsed.mlfb.length > 8 ? parsed.mlfb.substring(8) : ''
+              };
+              parsed.modelType = matchedFamily.category;
+            }
+
+            const updatedItem: BatchItem = {
+              ...item,
+              dataUrl,
+              status: 'success',
+              progress: 100,
+              extracted: parsed,
+              rawText: data.rawText || `MLFB: ${formattedMlfb}`
+            };
+            resolve(updatedItem);
+          } else {
+            // Fallback to Tesseract locally for this item
+            const tesseractResult = await runTesseractOnDataUrl(dataUrl, item.id);
+            resolve({
+              ...item,
+              dataUrl,
+              status: tesseractResult.success ? 'success' : 'failed',
+              error: tesseractResult.success ? undefined : 'Error en lectura local',
+              progress: 100,
+              extracted: tesseractResult.parsed,
+              rawText: tesseractResult.rawText
+            });
+          }
+        } catch (err: any) {
+          // Fallback to Tesseract
+          try {
+            const tesseractResult = await runTesseractOnDataUrl(dataUrl, item.id);
+            resolve({
+              ...item,
+              dataUrl,
+              status: tesseractResult.success ? 'success' : 'failed',
+              error: tesseractResult.success ? undefined : err.message || 'Error de conexión',
+              progress: 100,
+              extracted: tesseractResult.parsed,
+              rawText: tesseractResult.rawText
+            });
+          } catch (tessErr) {
+            resolve({
+              ...item,
+              dataUrl,
+              status: 'failed',
+              error: err.message || 'Error de lectura',
+              progress: 100
+            });
+          }
+        }
+      };
+      reader.onerror = () => {
+        resolve({ ...item, status: 'failed', error: 'Error al leer archivo', progress: 100 });
+      };
+      reader.readAsDataURL(item.file);
+    });
+  };
+
+  const startBatchProcess = async () => {
+    if (batchItems.length === 0 || isProcessingBatch) return;
+    setIsProcessingBatch(true);
+
+    const updatedItems = [...batchItems];
+    for (let i = 0; i < updatedItems.length; i++) {
+      // Set to processing
+      setBatchItems(prev => prev.map((item, idx) => idx === i ? { ...item, status: 'processing' } : item));
+      const result = await processBatchItem(updatedItems[i]);
+      updatedItems[i] = result;
+      
+      // Update state for real-time progress update
+      setBatchItems(prev => prev.map((item) => item.id === result.id ? result : item));
+    }
+
+    setIsProcessingBatch(false);
+  };
+
+  const saveBatchToCatalog = () => {
+    const successItems = batchItems.filter(item => item.status === 'success' && item.extracted);
+    if (successItems.length === 0) return;
+
+    let updatedPlates = [...plates];
+    
+    successItems.forEach((item, index) => {
+      const parsed = item.extracted!;
+      
+      // Generate default name
+      let defName = `Lote: Placa ${parsed.modelType === 'motor' ? 'Motor' : parsed.modelType === 'vfd' ? 'Variador' : parsed.modelType === 'plc' ? 'S7 PLC' : 'Equipo'}`;
+      if (parsed.power) defName += ` - ${parsed.power}`;
+      else if (parsed.serial) defName += ` - S/N ${parsed.serial.substring(0, 6)}`;
+      else defName += ` - #${plates.length + index + 1}`;
+
+      const newPlate: ScannedPlate = {
+        id: 'plate_' + Date.now() + '_' + index,
+        name: defName,
+        timestamp: new Date().toISOString(),
+        imageUrl: item.dataUrl || '',
+        rawText: item.rawText || '',
+        extracted: parsed
+      };
+
+      updatedPlates = [newPlate, ...updatedPlates];
+    });
+
+    savePlatesToLocalStorage(updatedPlates);
+    setSaveSuccess(true);
+    setTimeout(() => setSaveSuccess(false), 3050);
+    
+    // Auto load the first successfully processed element as the active selection
+    if (successItems.length > 0) {
+      const firstS = successItems[0].extracted!;
+      setExtractedData(firstS);
+      setRawText(successItems[0].rawText || '');
+      setProcessedImageSrc(successItems[0].dataUrl || '');
+      setSelectedPlateId(null);
+      
+      let defName = 'Placa Siemens ';
+      if (firstS.modelType === 'motor') defName += 'Motor';
+      else if (firstS.modelType === 'vfd') defName += 'Variador';
+      else if (firstS.modelType === 'plc') defName += 'S7 PLC';
+      else defName += 'Equipo';
+
+      if (firstS.power) defName += ` - ${firstS.power}`;
+      else if (firstS.serial) defName += ` - S/N ${firstS.serial.substring(0, 6)}`;
+      else defName += ` - #${plates.length + 1}`;
+      setCustomName(defName);
+    }
+
+    // Reset batch state
+    setIsBatchMode(false);
+    setBatchItems([]);
+  };
 
   // Initial load of history catalog from local storage
   useEffect(() => {
@@ -105,17 +358,23 @@ export default function App() {
 
   // Process File upload (Drag or Dialog)
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        if (event.target?.result) {
-          setRawImageSrc(event.target.result as string);
-          setIsAdjusting(true); // Open preprocessor panel
-          setShowCamera(false);
-        }
-      };
-      reader.readAsDataURL(file);
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      if (files.length === 1) {
+        setIsBatchMode(false);
+        const file = files[0];
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          if (event.target?.result) {
+            setRawImageSrc(event.target.result as string);
+            setIsAdjusting(true); // Open preprocessor panel
+            setShowCamera(false);
+          }
+        };
+        reader.readAsDataURL(file);
+      } else {
+        handleBatchFiles(Array.from(files));
+      }
     }
   };
 
@@ -126,17 +385,23 @@ export default function App() {
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
-    const file = e.dataTransfer.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        if (event.target?.result) {
-          setRawImageSrc(event.target.result as string);
-          setIsAdjusting(true);
-          setShowCamera(false);
-        }
-      };
-      reader.readAsDataURL(file);
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      if (files.length === 1) {
+        setIsBatchMode(false);
+        const file = files[0];
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          if (event.target?.result) {
+            setRawImageSrc(event.target.result as string);
+            setIsAdjusting(true);
+            setShowCamera(false);
+          }
+        };
+        reader.readAsDataURL(file);
+      } else {
+        handleBatchFiles(Array.from(files));
+      }
     }
   };
 
@@ -481,45 +746,73 @@ export default function App() {
           
           {/* Scanner Controls / Preprocessor Container */}
           <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xs space-y-5">
-            
-            {/* Top scanning options */}
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
-              <div>
+            {/* Top Scanning Options & Tabs */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4 border-b border-slate-800 pb-4 font-sans">
+              <div className="space-y-1">
                 <h3 className="font-sans font-bold text-sm text-white">
                   {isAdjusting ? 'Revisión y Ajuste Técnico' : 'Cargar Placa de Datos'}
                 </h3>
-                <p className="text-[11px] text-slate-500 mt-0.5">
-                  Captura u organiza la foto para un análisis de caracteres estable
-                </p>
+                {!isAdjusting && (
+                  <div className="flex items-center space-x-1 bg-slate-950 p-1 rounded-lg border border-slate-800 inline-flex mt-1">
+                    <button
+                      onClick={() => {
+                        setIsBatchMode(false);
+                        setBatchItems([]);
+                      }}
+                      className={`text-[10px] px-2.5 py-1 rounded font-bold transition-all cursor-pointer ${
+                        !isBatchMode 
+                          ? 'bg-cyan-600 text-white shadow-xs' 
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      🔍 Escaneo Único
+                    </button>
+                    <button
+                      onClick={() => {
+                        setIsBatchMode(true);
+                      }}
+                      className={`text-[10px] px-2.5 py-1 rounded font-bold transition-all cursor-pointer ${
+                        isBatchMode 
+                          ? 'bg-cyan-600 text-white shadow-xs' 
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      📦 Modo Lote (Múltiple)
+                    </button>
+                  </div>
+                )}
               </div>
 
               {!isAdjusting && (
                 <div className="flex flex-wrap items-center gap-2">
                   {/* Camera Scanner button */}
-                  <button
-                    id="open-camera-modal-btn"
-                    onClick={() => {
-                      setShowCamera(true);
-                      setRawImageSrc('');
-                      setIsAdjusting(false);
-                    }}
-                    className="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-700 font-sans font-bold text-xs text-white rounded border border-slate-700 flex items-center space-x-1.5 transition active:scale-95 shadow-lg shadow-cyan-950/40 cursor-pointer whitespace-nowrap"
-                  >
-                    <Camera className="w-3.5 h-3.5" />
-                    <span>Iniciar Cámara</span>
-                  </button>
+                  {!isBatchMode && (
+                    <button
+                      id="open-camera-modal-btn"
+                      onClick={() => {
+                        setShowCamera(true);
+                        setRawImageSrc('');
+                        setIsAdjusting(false);
+                      }}
+                      className="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-700 font-sans font-bold text-xs text-white rounded border border-slate-700 flex items-center space-x-1.5 transition active:scale-95 shadow-lg shadow-cyan-950/40 cursor-pointer whitespace-nowrap"
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>Iniciar Cámara</span>
+                    </button>
+                  )}
 
                   {/* Manual file upload */}
                   <label
                     htmlFor="file-uploader-input"
-                    className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-bold text-xs rounded flex items-center space-x-1.5 cursor-pointer transition active:scale-95 whitespace-nowrap"
+                    className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-bold text-xs rounded flex items-center space-x-1.5 cursor-pointer transition active:scale-95 whitespace-nowrap animate-pulse"
                   >
                     <Upload className="w-3.5 h-3.5" />
-                    <span>Subir Imagen</span>
+                    <span>{isBatchMode ? 'Seleccionar Fotos' : 'Subir Imagen'}</span>
                     <input
                       id="file-uploader-input"
                       type="file"
                       accept="image/*"
+                      multiple={isBatchMode}
                       onChange={handleFileUpload}
                       className="hidden"
                     />
@@ -529,8 +822,8 @@ export default function App() {
             </div>
 
             {/* Sub-modals & Workspace Panels */}
-            {showCamera && (
-              <div className="animate-fade-in">
+            {showCamera && !isBatchMode && (
+              <div className="animate-fade-in font-sans">
                 <CameraScanner 
                   onCapture={handleCameraCapture} 
                   onClose={() => setShowCamera(false)} 
@@ -538,8 +831,8 @@ export default function App() {
               </div>
             )}
 
-            {isAdjusting && rawImageSrc && (
-              <div className="animate-fade-in border-t border-slate-800 pt-1">
+            {isAdjusting && rawImageSrc && !isBatchMode && (
+              <div className="animate-fade-in border-t border-slate-800 pt-1 font-sans">
                 <ImageAdjuster 
                   src={rawImageSrc} 
                   onProcessed={runOcrProcessing} 
@@ -552,11 +845,11 @@ export default function App() {
             )}
 
             {/* Empty landing guide if no active scanner or preprocessor */}
-            {!isAdjusting && !showCamera && !isProcessing && !extractedData && (
+            {!isAdjusting && !showCamera && !isProcessing && !extractedData && !isBatchMode && (
               <div 
                 onDragOver={handleDragOver}
                 onDrop={handleDrop}
-                className="border-2 border-dashed border-slate-800 hover:border-cyan-500/50 rounded-xl p-8 bg-slate-950/40 text-center transition-all flex flex-col items-center justify-center space-y-4"
+                className="border-2 border-dashed border-slate-800 hover:border-cyan-500/50 rounded-xl p-8 bg-slate-950/40 text-center transition-all flex flex-col items-center justify-center space-y-4 font-sans"
               >
                 <div className="p-4 bg-slate-900 rounded-full text-cyan-500">
                   <Upload className="w-8 h-8 opacity-80" />
@@ -579,8 +872,152 @@ export default function App() {
               </div>
             )}
 
+            {/* Batch Processing Panel Workspace */}
+            {isBatchMode && (
+              <div className="space-y-4 animate-fade-in border-t border-slate-800 pt-4 font-sans">
+                {batchItems.length === 0 ? (
+                  <div 
+                    onDragOver={handleDragOver}
+                    onDrop={handleDrop}
+                    className="border-2 border-dashed border-slate-800 hover:border-cyan-500/50 rounded-xl p-8 bg-slate-950/40 text-center transition-all flex flex-col items-center justify-center space-y-4"
+                  >
+                    <div className="p-4 bg-slate-900 rounded-full text-cyan-500">
+                      <Upload className="w-8 h-8 opacity-85" />
+                    </div>
+                    <div>
+                      <h4 className="text-slate-200 text-xs font-semibold">Cargar Lote de Imágenes</h4>
+                      <p className="text-[10px] text-slate-500 mt-1 max-w-md mx-auto">
+                        Arrastra y suelta múltiples fotos a la vez, o haz clic en "Seleccionar Fotos" arriba para analizar múltiples equipos de manera masiva.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-950/65 p-4 rounded-xl border border-slate-800">
+                      <div className="flex items-center space-x-2">
+                        <span className="p-1 px-2 bg-cyan-600/10 text-cyan-400 rounded border border-cyan-500/10 font-bold text-[9px] uppercase tracking-wider font-mono">MODO PROCESAMIENTO MÚLTIPLE</span>
+                        <span className="text-[10px] text-slate-400 font-mono">({batchItems.length} placas listas)</span>
+                      </div>
+                      <div className="flex items-center space-x-2 w-full sm:w-auto">
+                        {!isProcessingBatch && batchItems.some(i => i.status === 'queued') && (
+                          <button
+                            onClick={startBatchProcess}
+                            className="flex-1 sm:flex-none px-4 py-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-700 hover:to-blue-700 text-white font-bold text-xs rounded transition active:scale-95 cursor-pointer flex items-center justify-center space-x-1.5 shadow-lg shadow-cyan-950/30"
+                          >
+                            <span>Comenzar Extracción de Lote ✨</span>
+                          </button>
+                        )}
+                        {isProcessingBatch && (
+                          <div className="flex-1 sm:flex-none px-4 py-2 bg-slate-850 text-slate-400 font-medium text-xs rounded flex items-center justify-center space-x-2 select-none border border-slate-800">
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                            <span>Procesando placas...</span>
+                          </div>
+                        )}
+                        {!isProcessingBatch && batchItems.some(i => i.status === 'success') && (
+                          <button
+                            onClick={saveBatchToCatalog}
+                            className="flex-1 sm:flex-none px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded transition active:scale-95 cursor-pointer flex items-center justify-center space-x-1.5"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Archivar todo en Inventario ({batchItems.filter(i => i.status === 'success').length})</span>
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            setIsBatchMode(false);
+                            setBatchItems([]);
+                          }}
+                          disabled={isProcessingBatch}
+                          className="px-3 py-2 bg-slate-800 hover:bg-slate-700 hover:text-white border border-slate-700 text-slate-300 font-medium text-xs rounded transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          Limpiar
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-[360px] overflow-y-auto pr-1">
+                      {batchItems.map((item) => {
+                        const isSelected = item.extracted && extractedData === item.extracted;
+                        return (
+                          <button
+                            key={item.id}
+                            onClick={() => {
+                              if (item.status === 'success' && item.extracted) {
+                                setExtractedData(item.extracted);
+                                setRawText(item.rawText || '');
+                                if (item.dataUrl) setProcessedImageSrc(item.dataUrl);
+                              }
+                            }}
+                            className={`bg-slate-950 border p-3 rounded-xl flex items-center gap-3 relative overflow-hidden transition-all text-left w-full outline-hidden ${
+                              item.status === 'success' && item.extracted ? 'cursor-pointer hover:bg-slate-900/40' : ''
+                            } ${
+                              isSelected ? 'ring-1 ring-cyan-500 border-cyan-500' : 'border-slate-850'
+                            }`}
+                          >
+                            {/* Left border indicator */}
+                            <div className={`absolute left-0 top-0 bottom-0 w-1 ${
+                              item.status === 'success' ? 'bg-emerald-500' :
+                              item.status === 'failed' ? 'bg-rose-500' :
+                              item.status === 'processing' ? 'bg-cyan-500' : 'bg-slate-705'
+                            }`} />
+
+                            <div className="w-12 h-12 bg-slate-900 rounded-lg overflow-hidden flex-shrink-0 border border-slate-800 flex items-center justify-center text-slate-600 font-mono">
+                              {item.dataUrl ? (
+                                <img src={item.dataUrl} alt="miniatura" className="w-full h-full object-cover" />
+                              ) : (
+                                <Upload className="w-4 h-4 opacity-40" />
+                              )}
+                            </div>
+
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-1.5">
+                                <span className="text-xs font-mono font-semibold text-slate-200 truncate block w-full" title={item.name}>
+                                  {item.name}
+                                </span>
+                              </div>
+                              <span className="text-[9px] text-slate-500 font-mono block">
+                                {(item.size / 1024).toFixed(1)} KB • {
+                                  item.status === 'queued' ? 'En cola ⏳' :
+                                  item.status === 'processing' ? 'Procesando 🔄' :
+                                  item.status === 'success' ? 'Éxito ✅ (Haz clic p/ ver)' : 'No reconocido ❌'
+                                }
+                              </span>
+
+                              {/* Progress bar */}
+                              {item.status === 'processing' && (
+                                <div className="w-full bg-slate-900 h-1 rounded-full overflow-hidden mt-1.5">
+                                  <div className="bg-cyan-500 h-full transition-all duration-300" style={{ width: `${item.progress}%` }}></div>
+                                </div>
+                              )}
+
+                              {item.status === 'success' && item.extracted && (
+                                <div className="mt-1.5 flex items-center justify-between bg-emerald-500/5 px-2 py-0.5 rounded border border-emerald-500/10">
+                                  <span className="text-[9px] text-emerald-400 font-mono font-bold uppercase truncate max-w-[140px]" title={item.extracted.mlfbFormatted}>
+                                    {item.extracted.mlfbFormatted || 'PENDIENTE'}
+                                  </span>
+                                  <span className="text-[8px] px-1 bg-emerald-950/20 text-emerald-400 font-sans font-medium rounded">
+                                    {item.extracted.ocrEngine === 'gemini' ? '✨ IA' : '⚙️ local'}
+                                  </span>
+                                </div>
+                              )}
+
+                              {item.status === 'failed' && (
+                                <span className="text-[9px] text-rose-400 font-sans font-medium block mt-1">
+                                  {item.error || 'Lectura de placa fallida'}
+                                </span>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
             {/* OCR Processing Active overlay */}
-            {isProcessing && (
+            {isProcessing && !isBatchMode && (
               <div className="bg-slate-950/70 border border-slate-800 p-6 rounded-xl flex flex-col items-center justify-center text-center space-y-4 shadow-inner">
                 <RefreshCw className="w-10 h-10 text-cyan-400 animate-spin" />
                 <div className="space-y-1 w-full max-w-xs font-mono">
@@ -600,7 +1037,7 @@ export default function App() {
             )}
 
             {/* Active Image representation */}
-            {!isAdjusting && !showCamera && processedImageSrc && (
+            {!isAdjusting && !showCamera && processedImageSrc && !isBatchMode && (
               <div className="relative bg-slate-950/70 p-4 border border-slate-800 rounded-2xl flex flex-col md:flex-row items-center gap-4">
                 <div className="w-full md:w-1/3 aspect-video md:aspect-square bg-slate-900 rounded-xl overflow-hidden flex items-center justify-center border border-slate-800">
                   {processedImageSrc.startsWith('data:image/svg') ? (

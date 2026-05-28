@@ -43,3 +43,16 @@ export interface TesseractProgress {
   status: string;
   progress: number;
 }
+
+export interface BatchItem {
+  id: string;
+  name: string;
+  size: number;
+  file: File;
+  status: 'queued' | 'processing' | 'success' | 'failed';
+  error?: string;
+  progress: number;
+  dataUrl?: string;
+  extracted?: ExtractionResults;
+  rawText?: string;
+}
