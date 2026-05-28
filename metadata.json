@@ -1,0 +1,6 @@
+{
+  "name": "Siemens ID Plate Extractor",
+  "description": "Extractor local de códigos de producto MLFB y opciones Z desde fotos de placas de datos Siemens usando Tesseract OCR.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
