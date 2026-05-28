@@ -10,6 +10,14 @@ export interface ScannedPlate {
   imageUrl?: string;
   rawText: string;
   extracted: ExtractionResults;
+  projectId?: string; // ID of the project it belongs to
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  timestamp: string;
+  description?: string;
 }
 
 export interface ExtractionResults {
@@ -48,6 +56,8 @@ export interface BatchItem {
   id: string;
   name: string;
   size: number;
+  compressedSize?: number;
+  percentageSaved?: number;
   file: File;
   status: 'queued' | 'processing' | 'success' | 'failed';
   error?: string;

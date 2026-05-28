@@ -129,7 +129,15 @@ export const SIEMENS_Z_CODES: { [key: string]: string } = {
   'Y50': 'Placa de datos adicional metálica (suelta o remachada en el chásis)',
   'Y80': 'Placa de características con textos especiales definidos por el cliente (ej. Número de TAG interno)',
   'Y82': 'Datos de rendimiento grabados especiales alternativos exigidos por regulaciones locales',
-  'Y84': 'Logotipo o marca del distribuidor OEM grabada de fábrica en la placa del motor'
+  'Y84': 'Logotipo o marca del distribuidor OEM grabada de fábrica en la placa del motor',
+
+  // Custom Options & VFD Module Specs
+  'D99': 'Opción especial de fábrica o diseño personalizado según planos del proyecto',
+  'M21': 'Rodamiento de rodillos cilíndricos (reforzado) para cargas radiales elevadas',
+  'M70': 'Borne o pletina de puesta a tierra externa adicional en carcasa',
+  'MB4': 'Bloqueador de rotor mecánico integrado para transporte marítimo seguro',
+  'M01': 'Rodamiento robusto en extremo de acoplamiento (lado DE)',
+  'QB2': 'Variador con protocolo de ensayos eléctricos certificados de fábrica'
 };
 
 /**
@@ -291,63 +299,116 @@ export function parseSiemensPlate(rawText: string): ExtractionResults {
   const mlfbRegex2 = /\b(1[A-Z0-9]{3})\s*([A-Z0-9]{3})\s*[-_—–¯]?\s*([A-Z0-9]{2})\s*([A-Z0-9]{3})\b/i;
 
   // Let's evaluate each line to find the best candidate
+  // We first perform a high-priority search on lines containing known Siemens prefixes
   for (const line of lines) {
     const trimmedLine = line.trim();
-    
-    // Skip lines that are obviously just metadata like certificates or speed
+    if (!trimmedLine) continue;
+
+    // Skip lines that are obviously just other metrics
     if (/^[A-Z]{2,3}\s+\d{4,}/i.test(trimmedLine) && !trimmedLine.toUpperCase().includes('ES7') && !trimmedLine.toUpperCase().includes('6SL')) {
       continue; 
     }
 
-    // Clean logistics/shipping prefixes from the line so MLFB starts cleanly with a word boundary
+    // Clean logistics/shipping prefixes from the line so MLFB starts cleanly
     const cleanLine = trimmedLine
       .replace(/^(?:MLFB|ORDER\s+NO|CATALOG\s+NUMBER|CATALOG\s+NO|CAT\s+NO|MODEL|REF|PART\s+NO|1P|P\/N|PN|ART\s*-\s*NR)[:.\s=_\-—–]*\b/i, '')
       .trim();
 
-    // Try matching Regex 1 on the cleaned line
-    const match1 = cleanLine.match(mlfbRegex1);
-    if (match1) {
-      const matchStr = match1[0].replace(/\s+/g, '-').replace(/[-_—–¯]+/g, '-').toUpperCase();
-      const prefix = matchStr.substring(0, 3);
-      if (SIEMENS_FAMILIES[prefix] || ['6ES', '6SL', '1LA', '1LE', '1LG', '3RT', '3RV', '1FK', '1FT', '6AV', '6EP'].includes(prefix) || prefix.startsWith('1') || prefix.startsWith('3') || prefix.startsWith('5') || prefix.startsWith('6')) {
-        mlfbCandidate = matchStr;
-        confidence = 90;
-        break; // Excellent match
-      } else {
-        mlfbCandidate = matchStr;
-        confidence = 65;
-      }
-    }
+    const upperCleanLine = cleanLine.toUpperCase();
+    
+    // Check if contains a known Siemens prefix
+    const knownPrefixes = [
+      '6SL', '6ES', '1LE', '1LA', '1LG', '1LH', '1LP', '1PH', '1FK', '1FT', '1FS', '1MB', '1PP', '2KJ',
+      '3RT', '3RV', '3RU', '3UA', '3LD', '3NE', '5SY', '6AV', '6EP', '6GK', '6FC', '6FX', '6SE', '6SN',
+      '3SE', '6UG', '3UN', '3SF'
+    ];
 
-    // Try regex 2 on the cleaned line
-    const match2 = cleanLine.match(mlfbRegex2);
-    if (match2) {
-      const formatted = `${match2[1]}${match2[2]}-${match2[3]}${match2[4]}`.toUpperCase();
-      mlfbCandidate = formatted;
-      confidence = 85;
-      break;
-    }
-  }
-
-  // If no match by standard regex, let's look for strings starting with a known Siemens prefix
-  if (!mlfbCandidate) {
-    for (const prefix of Object.keys(SIEMENS_FAMILIES)) {
-      const escapedPrefix = prefix.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-      const prefixRegex = new RegExp(`\\b(${escapedPrefix}[A-Z0-9-.]{8,20})\\b`, 'i');
-      for (const line of lines) {
-        const cleanLine = line.replace(/^(?:MLFB|ORDER\s+NO|1P|PART\s+NO)[:.\s=_\-—–]*/i, '').trim();
-        const pMatch = cleanLine.match(prefixRegex);
-        if (pMatch) {
-          mlfbCandidate = pMatch[1].replace(/[-_—–¯]+/g, '-').toUpperCase();
-          confidence = 75;
-          break;
+    let prefixIndex = -1;
+    let matchedPrefix = '';
+    for (const p of knownPrefixes) {
+      const idx = upperCleanLine.indexOf(p);
+      if (idx !== -1) {
+        if (prefixIndex === -1 || idx < prefixIndex) {
+          prefixIndex = idx;
+          matchedPrefix = p;
         }
       }
-      if (mlfbCandidate) break;
+    }
+
+    if (prefixIndex !== -1) {
+      // Step 1: Extract from the prefix to the end of the line
+      let rawCandidate = cleanLine.substring(prefixIndex).trim();
+
+      // Step 2: Strip any trailing comments or "Gewicht", "Qty" or custom metadata
+      rawCandidate = rawCandidate.split(/\s+(?:weight|gewicht|kg|at|ua|ie|qty)\b/i)[0].trim();
+
+      // Step 3: Remove ALL spaces because standard Siemens MLFB represents a solid code sequence [A-Z0-9-]
+      const candidateNoSpaces = rawCandidate.replace(/\s+/g, '');
+
+      // Step 4: Validate against standard Siemens formats (No-Space regexes)
+      // Matches standard 16-character structure, e.g., 6SL37201TG341AA3Z or 1LE10011DB434AF4
+      const mlfbNoSpaceRegex1 = /^([1-9A-Z0-9]{7})-?([0-9A-Z]{5})-?([0-9A-Z]{4,5})(?:-?(Z|[0-9A-Z0-9]{1,4}))?$/i;
+      // Matches standard 12-character motor structure, e.g., 1LA70834AA10
+      const mlfbNoSpaceRegex2 = /^(1[A-Z0-9]{3})([A-Z0-9]{3})-?([A-Z0-9]{2})([A-Z0-9]{3})$/i;
+
+      const m1 = candidateNoSpaces.match(mlfbNoSpaceRegex1);
+      if (m1) {
+        const block1 = m1[1];
+        const block2 = m1[2];
+        const block3 = m1[3];
+        const block4 = m1[4] ? '-' + m1[4] : '';
+        mlfbCandidate = (block1 + '-' + block2 + '-' + block3 + block4).toUpperCase();
+        confidence = 95;
+        break; // Excellent exact match
+      }
+
+      const m2 = candidateNoSpaces.match(mlfbNoSpaceRegex2);
+      if (m2) {
+        mlfbCandidate = (m2[1] + m2[2] + '-' + m2[3] + m2[4]).toUpperCase();
+        confidence = 90;
+        break; // Excellent motor matches
+      }
+
+      // Backup: If it doesn't fit standard block boundary exactly but has reasonable length and prefix
+      if (candidateNoSpaces.length >= 10 && candidateNoSpaces.length <= 25) {
+        let formattedStr = candidateNoSpaces;
+        // Format with separators if missing
+        if (!formattedStr.includes('-')) {
+          if (formattedStr.length >= 16) {
+            formattedStr = formattedStr.substring(0, 7) + '-' + formattedStr.substring(7, 12) + '-' + formattedStr.substring(12, 16) + (formattedStr.substring(16) ? '-' + formattedStr.substring(16) : '');
+          } else if (formattedStr.length >= 12) {
+            formattedStr = formattedStr.substring(0, 7) + '-' + formattedStr.substring(7, 12) + (formattedStr.substring(12) ? '-' + formattedStr.substring(12) : '');
+          }
+        }
+        mlfbCandidate = formattedStr.toUpperCase();
+        confidence = 80;
+      }
     }
   }
 
-  // If still nothing, search for generic dash-separated structures
+  // Backup Pattern searches across entire text if no prefix line succeeded
+  if (!mlfbCandidate) {
+    const mlfbRegex1 = /\b([1-9A-Z]{3,4}\s*[0-9A-Z]{3,4})\s*[-_—–¯]?\s*([0-9A-Z]{5})\s*[-_—–¯]?\s*([0-9A-Z]{4,5})(?:\s*[-_—–¯]\s*(Z|[0-9A-Z]{1,4}))?\b/i;
+    const mlfbRegex2 = /\b(1[A-Z0-9]{3})\s*([A-Z0-9]{3})\s*[-_—–¯]?\s*([0-9A-Z]{2})\s*([0-9A-Z]{3})\b/i;
+
+    for (const line of lines) {
+      const cleanLine = line.replace(/^(?:MLFB|ORDER\s+NO|1P|PART\s+NO)[:.\s=_\-—–]*/i, '').trim();
+      const m1 = cleanLine.match(mlfbRegex1);
+      if (m1) {
+        mlfbCandidate = m1[0].replace(/\s+/g, '-').replace(/[-_—–¯]+/g, '-').toUpperCase();
+        confidence = 70;
+        break;
+      }
+      const m2 = cleanLine.match(mlfbRegex2);
+      if (m2) {
+        mlfbCandidate = m2[1] + m2[2] + '-' + m2[3] + m2[4];
+        confidence = 70;
+        break;
+      }
+    }
+  }
+
+  // Final emergency backup: search for any dash-separated structure resembling a code
   if (!mlfbCandidate) {
     const backupRegex = /\b([0-9A-Z]{4,7}-[0-9A-Z]{5}-[0-9A-Z]{4,5}(-Z)?)\b/i;
     for (const line of lines) {
@@ -396,42 +457,38 @@ export function parseSiemensPlate(rawText: string): ExtractionResults {
   // - "-Z A11+K20+L20"
   // - "Z: A11 K20"
   // - "Option Z : G11"
-  // Let's search lines containing "Z" / "Z-Option" / "Z=" / "Z:" or "OPCION Z"
+  // Let's search lines containing "Z" / "Z-Option" / "Z=" / "Z:" or "OPCION Z" or lists joined by "+"
   let zTextContext = '';
-  const zCodeRegex = /\b([A-Z]\d{2})\b/g;
+  // Support [A-Z]\d{2} (e.g. A11) or [A-Z]{2}\d (e.g. MB4)
+  const zCodeRegex = /\b([A-Z]\d{2}|[A-Z]{2}\d)\b/g;
 
-  // Let's check lines for "Z" indicators
+  // Let's check lines for "Z" indicators or list indicators "+"
   for (const line of lines) {
     const upperLine = line.toUpperCase();
-    if (upperLine.includes(' Z ') || upperLine.includes('-Z') || upperLine.includes('Z=') || upperLine.includes('Z:') || upperLine.includes('OPCION') || upperLine.includes('OPTION')) {
+    if (upperLine.includes(' Z ') || upperLine.includes('-Z') || upperLine.includes('Z=') || upperLine.includes('Z:') || upperLine.includes('OPCION') || upperLine.includes('OPTION') || upperLine.includes('+')) {
       zTextContext += ' ' + line;
     }
   }
 
-  // Extract all 3-char codes conforming to [A-Z]\d{2} (like A11, K20) from the context or the entire page
+  // Extract all 3-char codes conforming to [A-Z]\d{2} or [A-Z]{2}\d from the context or the entire page
   const foundCodes = new Set<string>();
   
   if (zTextContext) {
     let match;
-    while ((match = zCodeRegex.exec(zTextContext)) !== null) {
-      foundCodes.add(match[1].toUpperCase());
+    const upperZContext = zTextContext.toUpperCase();
+    while ((match = zCodeRegex.exec(upperZContext)) !== null) {
+      foundCodes.add(match[1]);
     }
   }
 
-  // If we found nothing in the direct Z context lines, let's scan the whole text for potential codes.
-  // We exclude codes that match parts of the MLFB or standard ratings (like IP55 -> P55 might look like a Z-code, IE3 -> E3 is not 3 chars).
-  // Also common words or standard ratings shouldn't be added.
-  if (foundCodes.size === 0) {
-    const globalMatches = cleanText.toUpperCase().match(/\b([A-Z]\d{2})\b/g);
-    if (globalMatches) {
-      globalMatches.forEach(code => {
-        // Make sure it's not a common false positive (like V400, kW11, Hz50, CLF -> F05)
-        // Ensure it's in our Siemens Z-Codes database, which validates it's a REAL Siemens option!
-        if (SIEMENS_Z_CODES[code]) {
-          foundCodes.add(code);
-        }
-      });
-    }
+  // Also scan the whole text for potential codes in the dictionary to be safe
+  const globalMatches = cleanText.toUpperCase().match(/\b([A-Z]\d{2}|[A-Z]{2}\d)\b/g);
+  if (globalMatches) {
+    globalMatches.forEach(code => {
+      if (SIEMENS_Z_CODES[code]) {
+        foundCodes.add(code);
+      }
+    });
   }
 
   // Map found Z-codes to their explanations
@@ -444,7 +501,8 @@ export function parseSiemensPlate(rawText: string): ExtractionResults {
 
   // 3. EXTRACT SERIAL NUMBER (No. / SERIAL / S No. / F-Nr)
   // Patterns: "No. UD 1502446" or "N-1234567" or "S-No: 1234"
-  const serialRegex = /(?:No\s*\.?\s*|SERIAL\s*\.?\s*|S\s*No\s*\.?\s*|F-Nr\s*\.?\s*|FABR\s*-\s*NR\s*\.?\s*|N\s*-\s*)([A-Z0-9\s-]{5,18})/i;
+  // Uses key word boundaries to avoid matching "No" inside of "Nominal" or other descriptive words.
+  const serialRegex = /(?:\bNo\b\s*\.?\s*|\bSERIAL\b\s*\.?\s*|\bS\s*No\b\s*\.?\s*|\bF-Nr\b\s*\.?\s*|\bFABR\s*-\s*NR\b\s*\.?\s*|\bN\s*-\s*)([A-Z0-9\s-]{5,18})/i;
   for (const line of lines) {
     const sMatch = line.match(serialRegex);
     if (sMatch) {
@@ -488,13 +546,13 @@ export function parseSiemensPlate(rawText: string): ExtractionResults {
 
   // 5. EXTRACT MOTOR TECHNICAL PARAMETERS
 
-  // VOLTAGE (V) - e.g. 230/400 V, 400Y, 690D, 380-415 V, 400 V ∆
-  // Often written as a range or with indicators
-  const voltageRegex = /\b(\d{3}\s*(?:\/\s*\d{3})?)\s*V\b|V\s*[:.-]?\s*(\d{3}(?:\/\d{3})?)\b|\b(\d{3}[D∆Y]?\s*(?:\/\s*\d{3}[D∆Y]?)?)\s*V\b/i;
+  // VOLTAGE (V) - e.g. 230/400 V, 400Y, 690D, 380-415 V, 400 V ∆, 0-480 V, 510-720 V
+  // Often written as a range or with indicators, using \d{1,4} to support starting at 0 V
+  const voltageRegex = /\b(\d{1,4}\s*(?:[-/]\s*\d{2,4})?)\s*[D∆Y]?\s*V\b|V\s*[:.-]?\s*(\d{1,4}(?:\s*[-/]\s*\d{1,4})?)\b/i;
   for (const line of lines) {
     const vMatch = line.match(voltageRegex);
     if (vMatch) {
-      res.voltage = (vMatch[1] || vMatch[2] || vMatch[3]).trim() + ' V';
+      res.voltage = (vMatch[1] || vMatch[2]).trim() + ' V';
       break;
     }
   }
